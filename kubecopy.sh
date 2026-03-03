@@ -128,12 +128,43 @@ find_writable_dir_local() {
             return 0
         fi
     done
+    
+    # Fallback to checking active mounts
+    if [ -r /proc/mounts ]; then
+        while read -r _ mount_point type _; do
+            # Skip read-only, network mounts, or obvious non-data paths
+            case "$type" in
+                nfs|cifs|smb*|proc|sysfs|devpts|tmpfs) continue ;;
+            esac
+            if touch "$mount_point/.kubecopy_test" 2>/dev/null; then
+                rm -f "$mount_point/.kubecopy_test"
+                echo "$mount_point"
+                return 0
+            fi
+        done < /proc/mounts
+    fi
     return 1
 }
 
 find_writable_dir_pod() {
     local ns="$1" pod="$2" kc="$3"
-    local cmd='for d in /dev/shm /tmp /var/tmp /home /root /; do if touch "$d/.kubecopy_test" 2>/dev/null; then rm -f "$d/.kubecopy_test"; echo "$d"; exit 0; fi; done; exit 1'
+    local cmd='
+        for d in /dev/shm /tmp /var/tmp /home /root /; do 
+            if touch "$d/.kubecopy_test" 2>/dev/null; then 
+                rm -f "$d/.kubecopy_test"; echo "$d"; exit 0; 
+            fi; 
+        done
+        
+        if [ -r /proc/mounts ]; then
+            while read -r _ mount_point type _; do
+                case "$type" in nfs|cifs|smb*|proc|sysfs|devpts|tmpfs) continue ;; esac
+                if touch "$mount_point/.kubecopy_test" 2>/dev/null; then
+                    rm -f "$mount_point/.kubecopy_test"; echo "$mount_point"; exit 0
+                fi
+            done < /proc/mounts
+        fi
+        exit 1
+    '
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
     kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
