@@ -20,6 +20,9 @@ DEST_PATH=""
 DEST_NS=""
 DEST_POD=""
 DEST_KUBECONFIG=""
+TMP_DIR_LOCAL_ARG=""
+TMP_DIR_ORIGIN_ARG=""
+TMP_DIR_DEST_ARG=""
 
 LOG_FILE="$HOME/.kubecopy.log"
 TMP_DIR_LOCAL=""
@@ -46,12 +49,16 @@ Options:
   --origin-ns NAMESPACE
   --origin-pod POD
   --origin-kubeconfig KUBECONFIG
+  --origin-tmp-dir PATH
 
   --dest-type [local|pod]
   --dest-path PATH
   --dest-ns NAMESPACE
   --dest-pod POD
   --dest-kubeconfig KUBECONFIG
+  --dest-tmp-dir PATH
+  
+  --local-tmp-dir PATH
 EOF
     exit 0
 }
@@ -121,8 +128,26 @@ pod_exec() {
 }
 
 find_writable_dir_local() {
-    for d in "/dev/shm" "$HOME" "/tmp" "/var/tmp" "$PWD"; do
-        if touch "$d/.kubecopy_test" 2>/dev/null; then
+    local req_kb="$1"
+    local explicit_dir="$2"
+    
+    if [ -n "$explicit_dir" ]; then
+        if touch "$explicit_dir/.kubecopy_test" 2>/dev/null && check_disk_space_local "$explicit_dir" "$req_kb"; then
+            rm -f "$explicit_dir/.kubecopy_test"
+            echo "$explicit_dir"
+            return 0
+        fi
+        log "Error: Provided local temp dir $explicit_dir is not writable or lacks space."
+        read -r -p "Enter a different local temporary directory path: " explicit_dir
+        if [ -n "$explicit_dir" ]; then
+            find_writable_dir_local "$req_kb" "$explicit_dir"
+            return $?
+        fi
+        return 1
+    fi
+
+    for d in "$HOME" "/tmp" "/var/tmp" "$PWD"; do
+        if touch "$d/.kubecopy_test" 2>/dev/null && check_disk_space_local "$d" "$req_kb" >/dev/null 2>&1; then
             rm -f "$d/.kubecopy_test"
             echo "$d"
             return 0
@@ -147,27 +172,74 @@ find_writable_dir_local() {
 }
 
 find_writable_dir_pod() {
-    local ns="$1" pod="$2" kc="$3"
-    local cmd='
-        for d in /dev/shm /tmp /var/tmp /home /root /; do 
-            if touch "$d/.kubecopy_test" 2>/dev/null; then 
-                rm -f "$d/.kubecopy_test"; echo "$d"; exit 0; 
+    local ns="$1" pod="$2" kc="$3" req_kb="$4" explicit_dir="$5"
+    local kc_arg=""
+    [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    
+    if [ -n "$explicit_dir" ]; then
+        local cmd_check_explicit="
+            if touch '$explicit_dir/.kubecopy_test' 2>/dev/null; then
+                rm -f '$explicit_dir/.kubecopy_test'
+                avail_kb=\$(df -k '$explicit_dir' | tail -1 | awk '{print \$(NF-2)}')
+                if [ \"\$avail_kb\" -ge \"$req_kb\" ]; then
+                    echo \"$explicit_dir\"
+                    exit 0
+                fi
+            fi
+            exit 1
+        "
+        if kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd_check_explicit" >/dev/null 2>&1; then
+            echo "$explicit_dir"
+            return 0
+        fi
+        log "Error: Provided pod temp dir $explicit_dir is not writable or lacks space."
+        # Because we can't easily prompt recursively inside a pod wrapper like this without messing up output capturing,
+        # we'll prompt locally and recursively call
+        read -r -p "Enter a different temporary directory path for pod $pod: " explicit_dir
+        if [ -n "$explicit_dir" ]; then
+            find_writable_dir_pod "$ns" "$pod" "$kc" "$req_kb" "$explicit_dir"
+            return $?
+        fi
+        return 1
+    fi
+
+    local cmd="
+        check_space() {
+            avail_kb=\$(df -k \"\$1\" | tail -1 | awk '{print \$(NF-2)}')
+            if [ -n \"\$avail_kb\" ] && [ \"\$avail_kb\" -ge \"$req_kb\" ]; then return 0; fi
+            return 1
+        }
+        for d in /tmp /var/tmp /home /root /; do 
+            if touch \"\$d/.kubecopy_test\" 2>/dev/null && check_space \"\$d\"; then 
+                rm -f \"\$d/.kubecopy_test\"; echo \"\$d\"; exit 0; 
             fi; 
-        done
+        done        done
         
         if [ -r /proc/mounts ]; then
             while read -r _ mount_point type _; do
                 case "$type" in nfs|cifs|smb*|proc|sysfs|devpts|tmpfs) continue ;; esac
-                if touch "$mount_point/.kubecopy_test" 2>/dev/null; then
+                if touch "$mount_point/.kubecopy_test" 2>/dev/null && check_space "$mount_point"; then
                     rm -f "$mount_point/.kubecopy_test"; echo "$mount_point"; exit 0
                 fi
             done < /proc/mounts
         fi
         exit 1
-    '
-    local kc_arg=""
-    [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
-    kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
+    "
+    local found
+    found=$(kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd")
+    if [ -n "$found" ]; then
+        echo "$found"
+        return 0
+    fi
+    # If we got here, defaults failed. Let's prompt.
+    log "Error: Default temporary paths on pod $pod lack space ($req_kb KB) or write access."
+    local explicit_dir
+    read -r -p "Enter a temporary directory path for pod $pod manually: " explicit_dir
+    if [ -n "$explicit_dir" ]; then
+        find_writable_dir_pod "$ns" "$pod" "$kc" "$req_kb" "$explicit_dir"
+        return $?
+    fi
+    return 1
 }
 
 check_disk_space_local() {
@@ -316,11 +388,14 @@ main() {
             --origin-ns) ORIGIN_NS="$2"; shift 2 ;;
             --origin-pod) ORIGIN_POD="$2"; shift 2 ;;
             --origin-kubeconfig) ORIGIN_KUBECONFIG="$2"; shift 2 ;;
+            --origin-tmp-dir) TMP_DIR_ORIGIN_ARG="$2"; shift 2 ;;
             --dest-type) DEST_TYPE="$2"; shift 2 ;;
             --dest-path) DEST_PATH="$2"; shift 2 ;;
             --dest-ns) DEST_NS="$2"; shift 2 ;;
             --dest-pod) DEST_POD="$2"; shift 2 ;;
             --dest-kubeconfig) DEST_KUBECONFIG="$2"; shift 2 ;;
+            --dest-tmp-dir) TMP_DIR_DEST_ARG="$2"; shift 2 ;;
+            --local-tmp-dir) TMP_DIR_LOCAL_ARG="$2"; shift 2 ;;
             *) echo "Unknown option: $1"; show_help ;;
         esac
     done
@@ -356,13 +431,28 @@ main() {
 
     log "Starting kubecopy from $ORIGIN_TYPE:$ORIGIN_PATH to $DEST_TYPE:$DEST_PATH"
 
+    local REQ_KB=0
+    # Determine Required KB upfront because we need it to negotiate temporary space
+    if [ "$ORIGIN_TYPE" = "local" ]; then
+        REQ_KB=$(get_size_local "$ORIGIN_PATH")
+    else
+        REQ_KB=$(get_size_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$ORIGIN_PATH")
+    fi
+
     # 1. Setup specific temporary directories
     if [ "$ORIGIN_TYPE" = "local" ] || [ "$DEST_TYPE" = "local" ]; then
         local w_local
-        w_local=$(find_writable_dir_local)
+        w_local=$(find_writable_dir_local "$REQ_KB" "$TMP_DIR_LOCAL_ARG")
         if [ -z "$w_local" ]; then
-            log "Error: Could not find writable directory on local machine."
-            exit 1
+            log "Error: Could not find writable directory on local machine with explicit fallback prompted."
+            # Final fallback prompt locally if automatic defaults failed entirely.
+            read -r -p "Enter a temporary directory path manually for local machine: " TMP_DIR_LOCAL_ARG
+            if [ -n "$TMP_DIR_LOCAL_ARG" ]; then
+                w_local=$(find_writable_dir_local "$REQ_KB" "$TMP_DIR_LOCAL_ARG")
+            fi
+            if [ -z "$w_local" ]; then
+                exit 1
+            fi
         fi
         TMP_DIR_LOCAL="$w_local/kubecopy_local_$$"
         mkdir -p "$TMP_DIR_LOCAL"
@@ -370,9 +460,9 @@ main() {
 
     if [ "$ORIGIN_TYPE" = "pod" ]; then
         local w_pod_org
-        w_pod_org=$(find_writable_dir_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG")
+        w_pod_org=$(find_writable_dir_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$REQ_KB" "$TMP_DIR_ORIGIN_ARG")
         if [ -z "$w_pod_org" ]; then
-            log "Error: Could not find writable directory on origin pod."
+            log "Error: Could not find or allocate writable directory on origin pod."
             exit 1
         fi
         TMP_DIR_ORIGIN="$w_pod_org/kubecopy_org_$$"
@@ -381,9 +471,9 @@ main() {
 
     if [ "$DEST_TYPE" = "pod" ]; then
         local w_pod_dst
-        w_pod_dst=$(find_writable_dir_pod "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG")
+        w_pod_dst=$(find_writable_dir_pod "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "$REQ_KB" "$TMP_DIR_DEST_ARG")
         if [ -z "$w_pod_dst" ]; then
-            log "Error: Could not find writable directory on destination pod."
+            log "Error: Could not find or allocate writable directory on destination pod."
             exit 1
         fi
         TMP_DIR_DEST="$w_pod_dst/kubecopy_dst_$$"
@@ -395,11 +485,8 @@ main() {
     local ARCHIVE_LOCAL="$TMP_DIR_LOCAL/$ARCHIVE_NAME"
     local TOTAL_CHUNKS=0
     local ORIGIN_HASH=""
-    local REQ_KB=0
 
     if [ "$ORIGIN_TYPE" = "local" ]; then
-        REQ_KB=$(get_size_local "$ORIGIN_PATH")
-        check_disk_space_local "$TMP_DIR_LOCAL" "$REQ_KB" || exit 1
         log "Archiving local path $ORIGIN_PATH..."
         tar -czf "$ARCHIVE_LOCAL" -C "$(dirname "$ORIGIN_PATH")" "$(basename "$ORIGIN_PATH")"
         ORIGIN_HASH=$(get_hash_local "$ARCHIVE_LOCAL")
@@ -408,8 +495,6 @@ main() {
         TOTAL_CHUNKS=$(split_file_local "$ARCHIVE_LOCAL" "$TMP_DIR_LOCAL/chunk" "$CHUNK_SIZE")
         log "Total chunks: $TOTAL_CHUNKS"
     else
-        REQ_KB=$(get_size_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$ORIGIN_PATH")
-        check_disk_space_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "${TMP_DIR_ORIGIN%/*}" "$REQ_KB" || exit 1
         log "Archiving origin pod path $ORIGIN_PATH..."
         local org_dir org_base
         org_dir="$(dirname "$ORIGIN_PATH")"
@@ -427,8 +512,6 @@ main() {
     local DEST_HASH=""
 
     if [ "$DEST_TYPE" = "local" ]; then
-        check_disk_space_local "$TMP_DIR_LOCAL" "$REQ_KB" || exit 1
-        
         while [ "$i" -lt "$TOTAL_CHUNKS" ]; do
             log "Transferring chunk $i..."
             if [ "$ORIGIN_TYPE" = "pod" ]; then
@@ -461,8 +544,6 @@ main() {
         fi
 
     else
-        check_disk_space_pod "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "${TMP_DIR_DEST%/*}" "$REQ_KB" || exit 1
-
         while [ "$i" -lt "$TOTAL_CHUNKS" ]; do
             log "Transferring chunk $i..."
             
@@ -477,7 +558,7 @@ main() {
             else
                 # Pod to Pod: fetch to local tmp, then push to dest
                 local w_local
-                w_local=$(find_writable_dir_local)
+                w_local=$(find_writable_dir_local "$REQ_KB" "$TMP_DIR_LOCAL_ARG")
                 TMP_DIR_LOCAL="$w_local/kubecopy_local_$$"
                 mkdir -p "$TMP_DIR_LOCAL"
                 

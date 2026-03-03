@@ -45,12 +45,16 @@ kubecopy [options]
   --origin-ns NAMESPACE
   --origin-pod POD
   --origin-kubeconfig KUBECONFIG
+  --origin-tmp-dir PATH
 
   --dest-type [local|pod]
   --dest-path PATH
   --dest-ns NAMESPACE
   --dest-pod POD
   --dest-kubeconfig KUBECONFIG
+  --dest-tmp-dir PATH
+
+  --local-tmp-dir PATH
 ```
 
 ### Examples
@@ -75,7 +79,8 @@ kubecopy --origin-type pod --origin-ns gitea-ext --origin-pod gitea-postresql-1 
 kubecopy --origin-type pod --origin-ns prod --origin-pod sql-0 \
          --origin-path /var/log/mysql \
          --dest-type pod --dest-ns dev --dest-pod sql-restore \
-         --dest-path /var/log/mysql
+         --dest-path /var/log/mysql \
+         --dest-tmp-dir /var/lib/mysql
 ```
 
 ---
