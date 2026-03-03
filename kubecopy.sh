@@ -214,7 +214,7 @@ find_writable_dir_pod() {
             if touch \"\$d/.kubecopy_test\" 2>/dev/null && check_space \"\$d\"; then 
                 rm -f \"\$d/.kubecopy_test\"; echo \"\$d\"; exit 0; 
             fi; 
-        done        done
+        done
         
         if [ -r /proc/mounts ]; then
             while read -r _ mount_point type _; do
