@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -70,6 +70,8 @@ cleanup() {
     [ -n "$TMP_DIR_LOCAL" ] && rm -rf "$TMP_DIR_LOCAL"
     
     if [ "$ORIGIN_TYPE" = "pod" ] && [ -n "$TMP_DIR_ORIGIN" ]; then
+        # Kill any lingering tar processes related to our archive
+        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "ps | grep '[t]ar -czf' | awk '{print \$1}' | xargs kill -9 2>/dev/null || true" || true
         pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "rm -rf '$TMP_DIR_ORIGIN'" || true
     fi
     
@@ -132,6 +134,88 @@ pod_exec() {
         return 0
     fi
     kubectl_with_retry $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
+}
+
+archive_local() {
+    local archive="$1" org_dir="$2" org_base="$3"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[DRY-RUN] tar -czf '$archive' -C '$org_dir' '$org_base'"
+        return 0
+    fi
+    local count=0
+    while [ "$count" -le "$MAX_RETRIES" ]; do
+        tar -czf "$archive" -C "$org_dir" "$org_base" &
+        local pid=$!
+        
+        local timer=0
+        local is_done=0
+        while [ "$timer" -lt "$KUBECTL_TIMEOUT" ]; do
+            if ! kill -0 $pid 2>/dev/null; then
+                is_done=1
+                break
+            fi
+            sleep 1
+            timer=$((timer + 1))
+        done
+        
+        if [ "$is_done" -eq 0 ]; then
+            while kill -0 $pid 2>/dev/null; do
+                log "tar process is still running locally. Watching instead of respawning..."
+                sleep 5
+            done
+        fi
+        
+        wait $pid
+        if [ $? -eq 0 ]; then
+            return 0
+        fi
+        
+        if [ "$count" -eq "$MAX_RETRIES" ]; then
+            break
+        fi
+        count=$((count + 1))
+        log "Local tar command failed. Retrying ($count/$MAX_RETRIES)..."
+        sleep 2
+    done
+    return 1
+}
+
+archive_pod() {
+    local ns="$1" pod="$2" kc="$3" archive="$4" org_dir="$5" org_base="$6"
+    local kc_arg=""
+    [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[DRY-RUN] kubectl $kc_arg -n $ns exec $pod -- sh -c \"tar -czf '$archive' -C '$org_dir' '$org_base'\""
+        return 0
+    fi
+    
+    local count=0
+    while [ "$count" -le "$MAX_RETRIES" ]; do
+        local cmd="tar -czf '$archive' -C '$org_dir' '$org_base'; echo \$? > '${archive}.exit'"
+        
+        timeout_cmd "$KUBECTL_TIMEOUT" kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd" || true
+        
+        while kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "ps aux 2>/dev/null || ps -ef 2>/dev/null || ps 2>/dev/null" | grep '[t]ar -czf' >/dev/null 2>&1; do
+            log "tar process is still running remotely. Watching instead of respawning..."
+            sleep 5
+        done
+        
+        local exit_code
+        exit_code=$(kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "cat '${archive}.exit' 2>/dev/null" || echo "1")
+        exit_code=$(echo "$exit_code" | tr -d '\r')
+        if [ "$exit_code" = "0" ]; then
+            return 0
+        fi
+        
+        if [ "$count" -eq "$MAX_RETRIES" ]; then
+            break
+        fi
+        count=$((count + 1))
+        log "Remote tar command failed (exit code $exit_code). Retrying ($count/$MAX_RETRIES)..."
+        sleep 2
+    done
+    return 1
 }
 
 find_writable_dir_local() {
@@ -521,7 +605,7 @@ main() {
 
     if [ "$ORIGIN_TYPE" = "local" ]; then
         log "Archiving local path $ORIGIN_PATH..."
-        tar -czf "$ARCHIVE_LOCAL" -C "$(dirname "$ORIGIN_PATH")" "$(basename "$ORIGIN_PATH")"
+        archive_local "$ARCHIVE_LOCAL" "$(dirname "$ORIGIN_PATH")" "$(basename "$ORIGIN_PATH")"
         ORIGIN_HASH=$(get_hash_local "$ARCHIVE_LOCAL")
         log "Origin hash: $ORIGIN_HASH"
         log "Splitting archive into chunks..."
@@ -532,7 +616,7 @@ main() {
         local org_dir org_base
         org_dir="$(dirname "$ORIGIN_PATH")"
         org_base="$(basename "$ORIGIN_PATH")"
-        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "tar -czf '$TMP_DIR_ORIGIN/$ARCHIVE_NAME' -C '$org_dir' '$org_base'"
+        archive_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME" "$org_dir" "$org_base"
         ORIGIN_HASH=$(get_hash_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME")
         log "Origin hash: $ORIGIN_HASH"
         log "Splitting archive into chunks on pod..."
