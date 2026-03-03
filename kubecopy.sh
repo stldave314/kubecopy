@@ -44,6 +44,7 @@ Options:
   --dry-run             Print steps but don't execute
   --chunk-size BYTES    Size of chunks (default 5242880)
   --retries N           Number of retries for kubectl operations (default 3)
+  --timeout N           Timeout in seconds for kubectl operations (default 30)
 
   --origin-type [local|pod]
   --origin-path PATH
@@ -390,6 +391,7 @@ main() {
             --dry-run) DRY_RUN=1; shift ;;
             --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
             --retries) MAX_RETRIES="$2"; shift 2 ;;
+            --timeout) KUBECTL_TIMEOUT="$2"; shift 2 ;;
             --origin-type) ORIGIN_TYPE="$2"; shift 2 ;;
             --origin-path) ORIGIN_PATH="$2"; shift 2 ;;
             --origin-ns) ORIGIN_NS="$2"; shift 2 ;;
@@ -449,6 +451,7 @@ main() {
         fi
         [ "$CHUNK_SIZE" != "$((5 * 1024 * 1024))" ] && repro_cmd="$repro_cmd --chunk-size \"$CHUNK_SIZE\""
         [ "$MAX_RETRIES" != "3" ] && repro_cmd="$repro_cmd --retries \"$MAX_RETRIES\""
+        [ "$KUBECTL_TIMEOUT" != "30" ] && repro_cmd="$repro_cmd --timeout \"$KUBECTL_TIMEOUT\""
         [ "$DRY_RUN" -eq 1 ] && repro_cmd="$repro_cmd --dry-run"
         
         echo ""
