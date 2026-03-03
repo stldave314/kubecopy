@@ -380,7 +380,10 @@ main() {
         REQ_KB=$(get_size_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$ORIGIN_PATH")
         check_disk_space_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "${TMP_DIR_ORIGIN%/*}" "$REQ_KB" || exit 1
         log "Archiving origin pod path $ORIGIN_PATH..."
-        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "tar -czf '$TMP_DIR_ORIGIN/$ARCHIVE_NAME' -C '\$(dirname \"$ORIGIN_PATH\")' '\$(basename \"$ORIGIN_PATH\")'"
+        local org_dir org_base
+        org_dir="$(dirname "$ORIGIN_PATH")"
+        org_base="$(basename "$ORIGIN_PATH")"
+        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "tar -czf '$TMP_DIR_ORIGIN/$ARCHIVE_NAME' -C '$org_dir' '$org_base'"
         ORIGIN_HASH=$(get_hash_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME")
         log "Origin hash: $ORIGIN_HASH"
         log "Splitting archive into chunks on pod..."
@@ -473,8 +476,10 @@ main() {
                 exit 1
             fi
             log "Hashes match. Extracting..."
-            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "mkdir -p '\$(dirname \"$DEST_PATH\")'"
-            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "tar -xzf '$TMP_DIR_DEST/$ARCHIVE_NAME' -C '\$(dirname \"$DEST_PATH\")'"
+            local dst_dir
+            dst_dir="$(dirname "$DEST_PATH")"
+            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "mkdir -p '$dst_dir'"
+            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "tar -xzf '$TMP_DIR_DEST/$ARCHIVE_NAME' -C '$dst_dir'"
         fi
     fi
 
