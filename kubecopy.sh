@@ -76,7 +76,8 @@ cleanup() {
         pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "rm -rf '$TMP_DIR_DEST'" || true
     fi
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup' EXIT
+trap 'log "Interrupted by user."; trap - EXIT; cleanup; exit 130' INT TERM
 
 timeout_cmd() {
     local timeout=$1
@@ -104,10 +105,14 @@ timeout_cmd() {
 kubectl_with_retry() {
     local retries=$MAX_RETRIES
     local count=0
-    while [ $count -le "$retries" ]; step_count=$((count+1)); count=$step_count; do
+    while [ "$count" -le "$retries" ]; do
         if timeout_cmd "$KUBECTL_TIMEOUT" kubectl "$@"; then
             return 0
         fi
+        if [ "$count" -eq "$retries" ]; then
+            break
+        fi
+        count=$((count + 1))
         log "kubectl command failed or timed out. Retrying ($count/$retries)..."
         sleep 2
     done
