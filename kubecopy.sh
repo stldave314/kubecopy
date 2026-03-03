@@ -23,6 +23,7 @@ DEST_KUBECONFIG=""
 TMP_DIR_LOCAL_ARG=""
 TMP_DIR_ORIGIN_ARG=""
 TMP_DIR_DEST_ARG=""
+PROMPTED=0
 
 LOG_FILE="$HOME/.kubecopy.log"
 TMP_DIR_LOCAL=""
@@ -371,6 +372,7 @@ prompt_if_empty() {
     if [ -z "$val" ]; then
         read -r -p "$prompt_text" val
         eval "$var_name=\"\$val\""
+        PROMPTED=1
     fi
 }
 
@@ -427,6 +429,29 @@ main() {
     if [ "$DEST_TYPE" != "local" ] && [ "$DEST_TYPE" != "pod" ]; then
         log "Error: Destination type must be 'local' or 'pod'."
         exit 1
+    fi
+    
+    if [ "$PROMPTED" -eq 1 ]; then
+        # Build the reproduction command
+        local repro_cmd="kubecopy --origin-type \"$ORIGIN_TYPE\" --origin-path \"$ORIGIN_PATH\" --dest-type \"$DEST_TYPE\" --dest-path \"$DEST_PATH\""
+        if [ "$ORIGIN_TYPE" = "pod" ]; then
+            repro_cmd="$repro_cmd --origin-ns \"$ORIGIN_NS\" --origin-pod \"$ORIGIN_POD\""
+            [ -n "$ORIGIN_KUBECONFIG" ] && repro_cmd="$repro_cmd --origin-kubeconfig \"$ORIGIN_KUBECONFIG\""
+        fi
+        if [ "$DEST_TYPE" = "pod" ]; then
+            repro_cmd="$repro_cmd --dest-ns \"$DEST_NS\" --dest-pod \"$DEST_POD\""
+            [ -n "$DEST_KUBECONFIG" ] && repro_cmd="$repro_cmd --dest-kubeconfig \"$DEST_KUBECONFIG\""
+        fi
+        [ "$CHUNK_SIZE" != "$((5 * 1024 * 1024))" ] && repro_cmd="$repro_cmd --chunk-size \"$CHUNK_SIZE\""
+        [ "$MAX_RETRIES" != "3" ] && repro_cmd="$repro_cmd --retries \"$MAX_RETRIES\""
+        [ "$DRY_RUN" -eq 1 ] && repro_cmd="$repro_cmd --dry-run"
+        
+        echo ""
+        echo "==========================================================="
+        echo "To repeat this exact operation without prompts, use:"
+        echo "$repro_cmd"
+        echo "==========================================================="
+        echo ""
     fi
 
     log "Starting kubecopy from $ORIGIN_TYPE:$ORIGIN_PATH to $DEST_TYPE:$DEST_PATH"
