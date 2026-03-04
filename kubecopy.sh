@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -558,8 +558,7 @@ main() {
     if [ "$ORIGIN_TYPE" = "pod" ]; then
         prompt_if_empty ORIGIN_NS "Origin namespace: "
         prompt_if_empty ORIGIN_POD "Origin pod name: "
-        prompt_if_empty ORIGIN_CONTAINER "Origin container name (leave empty for default): "
-        prompt_if_empty ORIGIN_KUBECONFIG "Origin kubeconfig file path (leave empty for default): "
+        # ORIGIN_CONTAINER and ORIGIN_KUBECONFIG are optional — no prompt
     fi
 
     prompt_if_empty DEST_PATH "Destination path (directory or file): "
@@ -567,8 +566,7 @@ main() {
     if [ "$DEST_TYPE" = "pod" ]; then
         prompt_if_empty DEST_NS "Destination namespace: "
         prompt_if_empty DEST_POD "Destination pod name: "
-        prompt_if_empty DEST_CONTAINER "Destination container name (leave empty for default): "
-        prompt_if_empty DEST_KUBECONFIG "Destination kubeconfig file path (leave empty for default): "
+        # DEST_CONTAINER and DEST_KUBECONFIG are optional — no prompt
     fi
 
     # Basic Validations
