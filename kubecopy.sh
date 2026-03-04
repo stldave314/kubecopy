@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.4.3"
+VERSION="1.4.4"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -330,14 +330,7 @@ find_writable_dir_pod() {
             echo "$explicit_dir"
             return 0
         fi
-        log "Error: Provided pod temp dir $explicit_dir is not writable or lacks space."
-        # Because we can't easily prompt recursively inside a pod wrapper like this without messing up output capturing,
-        # we'll prompt locally and recursively call
-        read -r -p "Enter a different temporary directory path for pod $pod: " explicit_dir
-        if [ -n "$explicit_dir" ]; then
-            find_writable_dir_pod "$ns" "$pod" "$container" "$kc" "$req_kb" "$explicit_dir"
-            return $?
-        fi
+        log "Error: Provided pod temp dir '$explicit_dir' is not writable or lacks space. Use --origin-tmp-dir or --dest-tmp-dir to specify one."
         return 1
     fi
 
@@ -370,14 +363,7 @@ find_writable_dir_pod() {
         echo "$found"
         return 0
     fi
-    # If we got here, defaults failed. Let's prompt.
-    log "Error: Default temporary paths on pod $pod lack space ($req_kb KB) or write access."
-    local explicit_dir
-    read -r -p "Enter a temporary directory path for pod $pod manually: " explicit_dir
-    if [ -n "$explicit_dir" ]; then
-        find_writable_dir_pod "$ns" "$pod" "$container" "$kc" "$req_kb" "$explicit_dir"
-        return $?
-    fi
+    log "Error: No writable temporary directory found on pod $pod. Use --origin-tmp-dir or --dest-tmp-dir to specify one."
     return 1
 }
 
@@ -634,15 +620,8 @@ main() {
         local w_local
         w_local=$(find_writable_dir_local "$REQ_KB" "$TMP_DIR_LOCAL_ARG")
         if [ -z "$w_local" ]; then
-            log "Error: Could not find writable directory on local machine with explicit fallback prompted."
-            # Final fallback prompt locally if automatic defaults failed entirely.
-            read -r -p "Enter a temporary directory path manually for local machine: " TMP_DIR_LOCAL_ARG
-            if [ -n "$TMP_DIR_LOCAL_ARG" ]; then
-                w_local=$(find_writable_dir_local "$REQ_KB" "$TMP_DIR_LOCAL_ARG")
-            fi
-            if [ -z "$w_local" ]; then
-                exit 1
-            fi
+            log "Error: No writable temporary directory found on local machine. Use --local-tmp-dir to specify one."
+            exit 1
         fi
         TMP_DIR_LOCAL="$w_local/kubecopy_local_$$"
         mkdir -p "$TMP_DIR_LOCAL"
