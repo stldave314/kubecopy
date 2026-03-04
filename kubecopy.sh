@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -20,11 +20,12 @@ ORIGIN_CONTAINER=""
 DEST_PATH=""
 DEST_NS=""
 DEST_POD=""
-DEST_KUBECONFIG=""
 DEST_CONTAINER=""
+DEST_KUBECONFIG=""
 TMP_DIR_LOCAL_ARG=""
 TMP_DIR_ORIGIN_ARG=""
 TMP_DIR_DEST_ARG=""
+VERBOSE=0
 PROMPTED=0
 
 LOG_FILE="$HOME/.kubecopy.log"
@@ -56,11 +57,6 @@ show_help() {
 kubecopy.sh [options]
 Options:
   --version             Show version
-  --dry-run             Print steps but don't execute
-  --chunk-size BYTES    Size of chunks (default 5242880)
-  --retries N           Number of retries for kubectl operations (default 3)
-  --timeout N           Timeout in seconds for kubectl operations (default 30)
-
   --origin-type [local|pod]
   --origin-path PATH
   --origin-ns NAMESPACE
@@ -77,7 +73,12 @@ Options:
   --dest-kubeconfig KUBECONFIG
   --dest-tmp-dir PATH
   
-  --local-tmp-dir PATH
+  --chunk-size BYTES    Size of chunks in bytes (default: 5242880 = 5MB)
+  --max-retries COUNT   Max retries for failing kubectl commands (default: 3)
+  --timeout SECS        Timeout in seconds for kubectl commands (default: 30)
+  --local-tmp-dir PATH  Local directory to store intermediate chunks
+  --dry-run             Print commands instead of executing them
+  --verbose             Show all executed shell commands
 EOF
     exit 0
 }
@@ -88,7 +89,7 @@ cleanup() {
     
     if [ "$ORIGIN_TYPE" = "pod" ] && [ -n "$TMP_DIR_ORIGIN" ]; then
         # Kill any lingering tar processes related to our archive
-        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "ps | grep '[t]ar -czP*f' | awk '{print \$1}' | xargs kill -9 2>/dev/null || true" || true
+        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "ps | grep '[t]ar -czf' | awk '{print \$1}' | xargs kill -9 2>/dev/null || true" || true
         pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "rm -rf '$TMP_DIR_ORIGIN'" || true
     fi
     
@@ -150,9 +151,11 @@ pod_exec() {
     local cnt_arg=""
     [ -n "$container" ] && cnt_arg="-c $container"
     if [ "$DRY_RUN" -eq 1 ]; then
+        # shellcheck disable=SC2086
         log "[DRY-RUN] kubectl $kc_arg -n $ns exec $cnt_arg $pod -- sh -c \"$cmd\""
         return 0
     fi
+    # shellcheck disable=SC2086
     kubectl_with_retry $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
@@ -164,7 +167,7 @@ archive_local() {
     fi
     local count=0
     while [ "$count" -le "$MAX_RETRIES" ]; do
-        tar -czPf "$archive" -C "$org_dir" "$org_base" 2>/dev/null &
+        tar -czf "$archive" -C "$org_dir" "$org_base" 2>/dev/null &
         local pid=$!
         
         local timer=0
@@ -218,18 +221,22 @@ archive_pod() {
     
     local count=0
     while [ "$count" -le "$MAX_RETRIES" ]; do
-        local cmd="tar -czPf '$archive' -C '$org_dir' '$org_base' 2>/dev/null; echo \$? > '${archive}.exit'"
+        local cmd="tar -czf '$archive' -C '$org_dir' '$org_base' 2>/dev/null; echo \$? > '${archive}.exit'"
         
+        # shellcheck disable=SC2086
         timeout_cmd "$KUBECTL_TIMEOUT" kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null || true
         
-        while kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "ps aux 2>/dev/null || ps -ef 2>/dev/null || ps 2>/dev/null" 2>/dev/null | grep '[t]ar -czP*f' >/dev/null 2>&1; do
+        # shellcheck disable=SC2086
+        while kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "ps aux 2>/dev/null || ps -ef 2>/dev/null || ps 2>/dev/null" 2>/dev/null | grep '[t]ar -czf' >/dev/null 2>&1; do
             local current_size
+            # shellcheck disable=SC2086
             current_size=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "du -sk '$archive' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "0")
             log "Creating archive on pod... (Current size: $(format_size "$current_size"))"
             sleep 5
         done
         
         local exit_code
+        # shellcheck disable=SC2086
         exit_code=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "cat '${archive}.exit' 2>/dev/null" 2>/dev/null || echo "1")
         exit_code=$(echo "$exit_code" | tr -d '\r')
         if [ "$exit_code" = "0" ]; then
@@ -309,6 +316,7 @@ find_writable_dir_pod() {
             fi
             exit 1
         "
+        # shellcheck disable=SC2086
         if kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd_check_explicit" >/dev/null 2>&1; then
             echo "$explicit_dir"
             return 0
@@ -318,7 +326,7 @@ find_writable_dir_pod() {
         # we'll prompt locally and recursively call
         read -r -p "Enter a different temporary directory path for pod $pod: " explicit_dir
         if [ -n "$explicit_dir" ]; then
-            find_writable_dir_pod "$ns" "$pod" "$kc" "$req_kb" "$explicit_dir"
+            find_writable_dir_pod "$ns" "$pod" "$container" "$kc" "$req_kb" "$explicit_dir"
             return $?
         fi
         return 1
@@ -347,6 +355,7 @@ find_writable_dir_pod() {
         exit 1
     "
     local found
+    # shellcheck disable=SC2086
     found=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null)
     if [ -n "$found" ]; then
         echo "$found"
@@ -382,6 +391,7 @@ check_disk_space_pod() {
     local cnt_arg=""
     [ -n "$container" ] && cnt_arg="-c $container"
     local avail_kb
+    # shellcheck disable=SC2086
     avail_kb=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "df -k $dir | tail -1 | awk '{print \$(NF-2)}'" 2>/dev/null)
     if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$req_kb" ]; then
         log "Error: Not enough space in pod $pod:$dir. Required: $req_kb KB, Available: ${avail_kb:-0} KB"
@@ -401,6 +411,7 @@ get_size_pod() {
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
     local cnt_arg=""
     [ -n "$container" ] && cnt_arg="-c $container"
+    # shellcheck disable=SC2086
     kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "du -sk $path | awk '{print \$1}'" 2>/dev/null
 }
 
@@ -434,6 +445,7 @@ split_file_pod() {
         done
         echo \"\$total_chunks\"
     "
+    # shellcheck disable=SC2086
     kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
@@ -464,6 +476,7 @@ get_hash_pod() {
         elif command -v md5 >/dev/null 2>&1; then md5 -q '$file' 2>/dev/null || md5 '$file' | awk '{print \$1}';
         else echo 'nohash'; fi
     "
+    # shellcheck disable=SC2086
     kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
@@ -492,6 +505,7 @@ rebuild_file_pod() {
             i=\$((i+1))
         done
     "
+    # shellcheck disable=SC2086
     kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
@@ -510,12 +524,7 @@ main() {
     # Parse Args
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --help|-h) show_help ;;
             --version) echo "kubecopy $VERSION"; exit 0 ;;
-            --dry-run) DRY_RUN=1; shift ;;
-            --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
-            --retries) MAX_RETRIES="$2"; shift 2 ;;
-            --timeout) KUBECTL_TIMEOUT="$2"; shift 2 ;;
             --origin-type) ORIGIN_TYPE="$2"; shift 2 ;;
             --origin-path) ORIGIN_PATH="$2"; shift 2 ;;
             --origin-ns) ORIGIN_NS="$2"; shift 2 ;;
@@ -530,8 +539,14 @@ main() {
             --dest-container) DEST_CONTAINER="$2"; shift 2 ;;
             --dest-kubeconfig) DEST_KUBECONFIG="$2"; shift 2 ;;
             --dest-tmp-dir) TMP_DIR_DEST_ARG="$2"; shift 2 ;;
+            --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
+            --max-retries) MAX_RETRIES="$2"; shift 2 ;;
+            --timeout) KUBECTL_TIMEOUT="$2"; shift 2 ;;
             --local-tmp-dir) TMP_DIR_LOCAL_ARG="$2"; shift 2 ;;
-            *) echo "Unknown option: $1"; show_help ;;
+            --dry-run) DRY_RUN=1; shift 1 ;;
+            --verbose) VERBOSE=1; set -x; shift 1 ;;
+            -h|--help) show_help; exit 0 ;;
+            *) log "Unknown option: $1"; show_help; exit 1 ;;
         esac
     done
 
@@ -580,14 +595,18 @@ main() {
             [ -n "$DEST_KUBECONFIG" ] && repro_cmd="$repro_cmd --dest-kubeconfig \"$DEST_KUBECONFIG\""
         fi
         [ "$CHUNK_SIZE" != "$((5 * 1024 * 1024))" ] && repro_cmd="$repro_cmd --chunk-size \"$CHUNK_SIZE\""
-        [ "$MAX_RETRIES" != "3" ] && repro_cmd="$repro_cmd --retries \"$MAX_RETRIES\""
+        [ "$MAX_RETRIES" != "3" ] && repro_cmd="$repro_cmd --max-retries \"$MAX_RETRIES\""
         [ "$KUBECTL_TIMEOUT" != "30" ] && repro_cmd="$repro_cmd --timeout \"$KUBECTL_TIMEOUT\""
+        [ -n "$TMP_DIR_LOCAL_ARG" ] && repro_cmd="$repro_cmd --local-tmp-dir \"$TMP_DIR_LOCAL_ARG\""
+        [ -n "$TMP_DIR_ORIGIN_ARG" ] && repro_cmd="$repro_cmd --origin-tmp-dir \"$TMP_DIR_ORIGIN_ARG\""
+        [ -n "$TMP_DIR_DEST_ARG" ] && repro_cmd="$repro_cmd --dest-tmp-dir \"$TMP_DIR_DEST_ARG\""
         [ "$DRY_RUN" -eq 1 ] && repro_cmd="$repro_cmd --dry-run"
+        [ "$VERBOSE" -eq 1 ] && repro_cmd="$repro_cmd --verbose"
         
         echo ""
         echo "==========================================================="
-        echo "To repeat this exact operation without prompts, use:"
-        echo "$repro_cmd"
+        log "To re-run exactly this operation later, use:"
+        log "  $repro_cmd"
         echo "==========================================================="
         echo ""
     fi
@@ -681,6 +700,7 @@ main() {
     else
         local cnt_arg=""
         [ -n "$ORIGIN_CONTAINER" ] && cnt_arg="-c $ORIGIN_CONTAINER"
+        # shellcheck disable=SC2086
         ARCHIVE_BYTES=$(kubectl -n "$ORIGIN_NS" exec $cnt_arg "$ORIGIN_POD" -- sh -c "wc -c < '$TMP_DIR_ORIGIN/$ARCHIVE_NAME' | tr -d ' '" 2>/dev/null)
     fi
     local ARCHIVE_KB=$((ARCHIVE_BYTES / 1024))
@@ -699,8 +719,10 @@ main() {
                 [ -n "$ORIGIN_CONTAINER" ] && cnt_arg="-c=$ORIGIN_CONTAINER"
                 
                 if [ "$DRY_RUN" -eq 1 ]; then
+                    # shellcheck disable=SC2086
                     log "[DRY-RUN] kubectl $kc_arg cp $ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i $TMP_DIR_LOCAL/chunk_$i $cnt_arg"
                 else
+                    # shellcheck disable=SC2086
                     kubectl_with_retry $kc_arg cp "$ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i" "$TMP_DIR_LOCAL/chunk_$i" $cnt_arg
                 fi
             else
@@ -737,8 +759,10 @@ main() {
                 [ -n "$DEST_CONTAINER" ] && cnt_arg="-c=$DEST_CONTAINER"
                 
                 if [ "$DRY_RUN" -eq 1 ]; then
+                    # shellcheck disable=SC2086
                     log "[DRY-RUN] kubectl $kc_arg cp $TMP_DIR_LOCAL/chunk_$i $DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i $cnt_arg"
                 else
+                    # shellcheck disable=SC2086
                     kubectl_with_retry $kc_arg cp "$TMP_DIR_LOCAL/chunk_$i" "$DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i" $cnt_arg
                 fi
             else
@@ -759,10 +783,14 @@ main() {
                 [ -n "$DEST_CONTAINER" ] && dcnt_arg="-c=$DEST_CONTAINER"
 
                 if [ "$DRY_RUN" -eq 1 ]; then
+                    # shellcheck disable=SC2086
                     log "[DRY-RUN] kubectl $okc_arg cp $ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i $TMP_DIR_LOCAL/chunk_$i $ocnt_arg"
+                    # shellcheck disable=SC2086
                     log "[DRY-RUN] kubectl $dkc_arg cp $TMP_DIR_LOCAL/chunk_$i $DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i $dcnt_arg"
                 else
+                    # shellcheck disable=SC2086
                     kubectl_with_retry $okc_arg cp "$ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i" "$TMP_DIR_LOCAL/chunk_$i" $ocnt_arg
+                    # shellcheck disable=SC2086
                     kubectl_with_retry $dkc_arg cp "$TMP_DIR_LOCAL/chunk_$i" "$DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i" $dcnt_arg
                     rm -f "$TMP_DIR_LOCAL/chunk_$i"
                 fi
