@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.4.1"
+VERSION="1.4.3"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -80,7 +80,6 @@ Options:
   --dry-run             Print commands instead of executing them
   --verbose             Show all executed shell commands
 EOF
-    exit 0
 }
 
 cleanup() {
@@ -123,10 +122,17 @@ timeout_cmd() {
     fi
 }
 
+# vlog: print the command about to be run when --verbose is active
+vlog() {
+    [ "$VERBOSE" -eq 1 ] && log "[CMD] $*"
+    return 0
+}
+
 kubectl_with_retry() {
     local retries=$MAX_RETRIES
     local count=0
     while [ "$count" -le "$retries" ]; do
+        vlog kubectl "$@"
         if timeout_cmd "$KUBECTL_TIMEOUT" kubectl "$@"; then
             return 0
         fi
@@ -156,6 +162,8 @@ pod_exec() {
         return 0
     fi
     # shellcheck disable=SC2086
+    vlog kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd"
+    # shellcheck disable=SC2086
     kubectl_with_retry $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
@@ -167,6 +175,7 @@ archive_local() {
     fi
     local count=0
     while [ "$count" -le "$MAX_RETRIES" ]; do
+        vlog tar -czf "$archive" -C "$org_dir" "$org_base"
         tar -czf "$archive" -C "$org_dir" "$org_base" 2>/dev/null &
         local pid=$!
         
@@ -544,7 +553,7 @@ main() {
             --timeout) KUBECTL_TIMEOUT="$2"; shift 2 ;;
             --local-tmp-dir) TMP_DIR_LOCAL_ARG="$2"; shift 2 ;;
             --dry-run) DRY_RUN=1; shift 1 ;;
-            --verbose) VERBOSE=1; set -x; shift 1 ;;
+            --verbose) VERBOSE=1; shift 1 ;;
             -h|--help) show_help; exit 0 ;;
             *) log "Unknown option: $1"; show_help; exit 1 ;;
         esac
