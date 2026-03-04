@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.4.4"
+VERSION="1.4.5"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -507,7 +507,9 @@ rebuild_file_pod() {
 prompt_if_empty() {
     local var_name="$1"
     local prompt_text="$2"
-    eval "local val=\"\$$var_name\""
+    # Use POSIX-safe indirect expansion via eval (without 'local' inside eval)
+    local val
+    val=$(eval "printf '%s' \"\$$var_name\"")
     if [ -z "$val" ]; then
         read -r -p "$prompt_text" val
         eval "$var_name=\"\$val\""
