@@ -3,7 +3,7 @@
 # Supports large files (>5MB) via tar & dd split, hashes, and retries.
 set -e
 
-VERSION="1.1.0"
+VERSION="1.3.0"
 CHUNK_SIZE=$((5 * 1024 * 1024)) # 5MB
 MAX_RETRIES=3
 KUBECTL_TIMEOUT=30 # seconds per operation
@@ -16,10 +16,12 @@ ORIGIN_PATH=""
 ORIGIN_NS=""
 ORIGIN_POD=""
 ORIGIN_KUBECONFIG=""
+ORIGIN_CONTAINER=""
 DEST_PATH=""
 DEST_NS=""
 DEST_POD=""
 DEST_KUBECONFIG=""
+DEST_CONTAINER=""
 TMP_DIR_LOCAL_ARG=""
 TMP_DIR_ORIGIN_ARG=""
 TMP_DIR_DEST_ARG=""
@@ -36,6 +38,19 @@ log() {
     echo "[$ts] $*" | tee -a "$LOG_FILE"
 }
 
+format_size() {
+    local size_kb=$1
+    if [ -z "$size_kb" ] || ! [ "$size_kb" -eq "$size_kb" ] 2>/dev/null; then
+        echo "0 MB"
+        return
+    fi
+    awk -v kb="$size_kb" 'BEGIN {
+        if (kb >= 1048576) printf "%.2f GB", kb/1048576
+        else if (kb >= 1024) printf "%.2f MB", kb/1024
+        else printf "%.2f KB", kb
+    }'
+}
+
 show_help() {
     cat <<EOF
 kubecopy.sh [options]
@@ -50,6 +65,7 @@ Options:
   --origin-path PATH
   --origin-ns NAMESPACE
   --origin-pod POD
+  --origin-container CONTAINER
   --origin-kubeconfig KUBECONFIG
   --origin-tmp-dir PATH
 
@@ -57,6 +73,7 @@ Options:
   --dest-path PATH
   --dest-ns NAMESPACE
   --dest-pod POD
+  --dest-container CONTAINER
   --dest-kubeconfig KUBECONFIG
   --dest-tmp-dir PATH
   
@@ -71,12 +88,12 @@ cleanup() {
     
     if [ "$ORIGIN_TYPE" = "pod" ] && [ -n "$TMP_DIR_ORIGIN" ]; then
         # Kill any lingering tar processes related to our archive
-        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "ps | grep '[t]ar -czf' | awk '{print \$1}' | xargs kill -9 2>/dev/null || true" || true
-        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "rm -rf '$TMP_DIR_ORIGIN'" || true
+        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "ps | grep '[t]ar -czP*f' | awk '{print \$1}' | xargs kill -9 2>/dev/null || true" || true
+        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "rm -rf '$TMP_DIR_ORIGIN'" || true
     fi
     
     if [ "$DEST_TYPE" = "pod" ] && [ -n "$TMP_DIR_DEST" ]; then
-        pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "rm -rf '$TMP_DIR_DEST'" || true
+        pod_exec "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "rm -rf '$TMP_DIR_DEST'" || true
     fi
 }
 trap 'cleanup' EXIT
@@ -125,15 +142,18 @@ kubectl_with_retry() {
 pod_exec() {
     local ns="$1"
     local pod="$2"
-    local kubeconfig="$3"
-    local cmd="$4"
+    local container="$3"
+    local kubeconfig="$4"
+    local cmd="$5"
     local kc_arg=""
     [ -n "$kubeconfig" ] && kc_arg="--kubeconfig=$kubeconfig"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "[DRY-RUN] kubectl $kc_arg -n $ns exec $pod -- sh -c \"$cmd\""
+        log "[DRY-RUN] kubectl $kc_arg -n $ns exec $cnt_arg $pod -- sh -c \"$cmd\""
         return 0
     fi
-    kubectl_with_retry $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
+    kubectl_with_retry $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
 archive_local() {
@@ -144,7 +164,7 @@ archive_local() {
     fi
     local count=0
     while [ "$count" -le "$MAX_RETRIES" ]; do
-        tar -czf "$archive" -C "$org_dir" "$org_base" &
+        tar -czPf "$archive" -C "$org_dir" "$org_base" 2>/dev/null &
         local pid=$!
         
         local timer=0
@@ -160,7 +180,11 @@ archive_local() {
         
         if [ "$is_done" -eq 0 ]; then
             while kill -0 $pid 2>/dev/null; do
-                log "tar process is still running locally. Watching instead of respawning..."
+                local current_size=0
+                if [ -f "$archive" ]; then
+                    current_size=$(du -sk "$archive" 2>/dev/null | awk '{print $1}')
+                fi
+                log "Creating archive... (Current size: $(format_size "$current_size"))"
                 sleep 5
             done
         fi
@@ -181,28 +205,32 @@ archive_local() {
 }
 
 archive_pod() {
-    local ns="$1" pod="$2" kc="$3" archive="$4" org_dir="$5" org_base="$6"
+    local ns="$1" pod="$2" container="$3" kc="$4" archive="$5" org_dir="$6" org_base="$7"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "[DRY-RUN] kubectl $kc_arg -n $ns exec $pod -- sh -c \"tar -czf '$archive' -C '$org_dir' '$org_base'\""
+        log "[DRY-RUN] kubectl $kc_arg -n $ns exec $cnt_arg $pod -- sh -c \"tar -czPf '$archive' -C '$org_dir' '$org_base' 2>/dev/null\""
         return 0
     fi
     
     local count=0
     while [ "$count" -le "$MAX_RETRIES" ]; do
-        local cmd="tar -czf '$archive' -C '$org_dir' '$org_base'; echo \$? > '${archive}.exit'"
+        local cmd="tar -czPf '$archive' -C '$org_dir' '$org_base' 2>/dev/null; echo \$? > '${archive}.exit'"
         
-        timeout_cmd "$KUBECTL_TIMEOUT" kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd" || true
+        timeout_cmd "$KUBECTL_TIMEOUT" kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null || true
         
-        while kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "ps aux 2>/dev/null || ps -ef 2>/dev/null || ps 2>/dev/null" | grep '[t]ar -czf' >/dev/null 2>&1; do
-            log "tar process is still running remotely. Watching instead of respawning..."
+        while kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "ps aux 2>/dev/null || ps -ef 2>/dev/null || ps 2>/dev/null" 2>/dev/null | grep '[t]ar -czP*f' >/dev/null 2>&1; do
+            local current_size
+            current_size=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "du -sk '$archive' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "0")
+            log "Creating archive on pod... (Current size: $(format_size "$current_size"))"
             sleep 5
         done
         
         local exit_code
-        exit_code=$(kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "cat '${archive}.exit' 2>/dev/null" || echo "1")
+        exit_code=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "cat '${archive}.exit' 2>/dev/null" 2>/dev/null || echo "1")
         exit_code=$(echo "$exit_code" | tr -d '\r')
         if [ "$exit_code" = "0" ]; then
             return 0
@@ -263,9 +291,11 @@ find_writable_dir_local() {
 }
 
 find_writable_dir_pod() {
-    local ns="$1" pod="$2" kc="$3" req_kb="$4" explicit_dir="$5"
+    local ns="$1" pod="$2" container="$3" kc="$4" req_kb="$5" explicit_dir="$6"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     
     if [ -n "$explicit_dir" ]; then
         local cmd_check_explicit="
@@ -279,7 +309,7 @@ find_writable_dir_pod() {
             fi
             exit 1
         "
-        if kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd_check_explicit" >/dev/null 2>&1; then
+        if kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd_check_explicit" >/dev/null 2>&1; then
             echo "$explicit_dir"
             return 0
         fi
@@ -317,7 +347,7 @@ find_writable_dir_pod() {
         exit 1
     "
     local found
-    found=$(kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd")
+    found=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null)
     if [ -n "$found" ]; then
         echo "$found"
         return 0
@@ -327,7 +357,7 @@ find_writable_dir_pod() {
     local explicit_dir
     read -r -p "Enter a temporary directory path for pod $pod manually: " explicit_dir
     if [ -n "$explicit_dir" ]; then
-        find_writable_dir_pod "$ns" "$pod" "$kc" "$req_kb" "$explicit_dir"
+        find_writable_dir_pod "$ns" "$pod" "$container" "$kc" "$req_kb" "$explicit_dir"
         return $?
     fi
     return 1
@@ -346,11 +376,13 @@ check_disk_space_local() {
 }
 
 check_disk_space_pod() {
-    local ns="$1" pod="$2" kc="$3" dir="$4" req_kb="$5"
+    local ns="$1" pod="$2" container="$3" kc="$4" dir="$5" req_kb="$6"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     local avail_kb
-    avail_kb=$(kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "df -k $dir | tail -1 | awk '{print \$(NF-2)}'")
+    avail_kb=$(kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "df -k $dir | tail -1 | awk '{print \$(NF-2)}'" 2>/dev/null)
     if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$req_kb" ]; then
         log "Error: Not enough space in pod $pod:$dir. Required: $req_kb KB, Available: ${avail_kb:-0} KB"
         return 1
@@ -364,10 +396,12 @@ get_size_local() {
 }
 
 get_size_pod() {
-    local ns="$1" pod="$2" kc="$3" path="$4"
+    local ns="$1" pod="$2" container="$3" kc="$4" path="$5"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
-    kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "du -sk $path | awk '{print \$1}'"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
+    kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "du -sk $path | awk '{print \$1}'" 2>/dev/null
 }
 
 split_file_local() {
@@ -384,9 +418,11 @@ split_file_local() {
 }
 
 split_file_pod() {
-    local ns="$1" pod="$2" kc="$3" file="$4" prefix="$5" chunk_size="$6"
+    local ns="$1" pod="$2" container="$3" kc="$4" file="$5" prefix="$6" chunk_size="$7"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     
     local cmd="
         file_size=\$(wc -c < '$file' | tr -d ' ')
@@ -398,7 +434,7 @@ split_file_pod() {
         done
         echo \"\$total_chunks\"
     "
-    kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
+    kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
 get_hash_local() {
@@ -416,17 +452,19 @@ get_hash_local() {
 }
 
 get_hash_pod() {
-    local ns="$1" pod="$2" kc="$3" file="$4"
+    local ns="$1" pod="$2" container="$3" kc="$4" file="$5"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     
-    local cmd='
-        if command -v sha256sum >/dev/null 2>&1; then sha256sum "'$file'" | awk "{print \$1}";
-        elif command -v md5sum >/dev/null 2>&1; then md5sum "'$file'" | awk "{print \$1}";
-        elif command -v md5 >/dev/null 2>&1; then md5 -q "'$file'" 2>/dev/null || md5 "'$file'" | awk "{print \$1}";
-        else echo "nohash"; fi
-    '
-    kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
+    local cmd="
+        if command -v sha256sum >/dev/null 2>&1; then sha256sum '$file' | awk '{print \$1}';
+        elif command -v md5sum >/dev/null 2>&1; then md5sum '$file' | awk '{print \$1}';
+        elif command -v md5 >/dev/null 2>&1; then md5 -q '$file' 2>/dev/null || md5 '$file' | awk '{print \$1}';
+        else echo 'nohash'; fi
+    "
+    kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
 rebuild_file_local() {
@@ -440,9 +478,11 @@ rebuild_file_local() {
 }
 
 rebuild_file_pod() {
-    local ns="$1" pod="$2" kc="$3" prefix="$4" total_chunks="$5" dest_file="$6"
+    local ns="$1" pod="$2" container="$3" kc="$4" prefix="$5" total_chunks="$6" dest_file="$7"
     local kc_arg=""
     [ -n "$kc" ] && kc_arg="--kubeconfig=$kc"
+    local cnt_arg=""
+    [ -n "$container" ] && cnt_arg="-c $container"
     
     local cmd="
         i=0
@@ -452,7 +492,7 @@ rebuild_file_pod() {
             i=\$((i+1))
         done
     "
-    kubectl $kc_arg -n "$ns" exec "$pod" -- sh -c "$cmd"
+    kubectl $kc_arg -n "$ns" exec $cnt_arg "$pod" -- sh -c "$cmd" 2>/dev/null
 }
 
 prompt_if_empty() {
@@ -480,12 +520,14 @@ main() {
             --origin-path) ORIGIN_PATH="$2"; shift 2 ;;
             --origin-ns) ORIGIN_NS="$2"; shift 2 ;;
             --origin-pod) ORIGIN_POD="$2"; shift 2 ;;
+            --origin-container) ORIGIN_CONTAINER="$2"; shift 2 ;;
             --origin-kubeconfig) ORIGIN_KUBECONFIG="$2"; shift 2 ;;
             --origin-tmp-dir) TMP_DIR_ORIGIN_ARG="$2"; shift 2 ;;
             --dest-type) DEST_TYPE="$2"; shift 2 ;;
             --dest-path) DEST_PATH="$2"; shift 2 ;;
             --dest-ns) DEST_NS="$2"; shift 2 ;;
             --dest-pod) DEST_POD="$2"; shift 2 ;;
+            --dest-container) DEST_CONTAINER="$2"; shift 2 ;;
             --dest-kubeconfig) DEST_KUBECONFIG="$2"; shift 2 ;;
             --dest-tmp-dir) TMP_DIR_DEST_ARG="$2"; shift 2 ;;
             --local-tmp-dir) TMP_DIR_LOCAL_ARG="$2"; shift 2 ;;
@@ -501,6 +543,7 @@ main() {
     if [ "$ORIGIN_TYPE" = "pod" ]; then
         prompt_if_empty ORIGIN_NS "Origin namespace: "
         prompt_if_empty ORIGIN_POD "Origin pod name: "
+        prompt_if_empty ORIGIN_CONTAINER "Origin container name (leave empty for default): "
         prompt_if_empty ORIGIN_KUBECONFIG "Origin kubeconfig file path (leave empty for default): "
     fi
 
@@ -509,6 +552,7 @@ main() {
     if [ "$DEST_TYPE" = "pod" ]; then
         prompt_if_empty DEST_NS "Destination namespace: "
         prompt_if_empty DEST_POD "Destination pod name: "
+        prompt_if_empty DEST_CONTAINER "Destination container name (leave empty for default): "
         prompt_if_empty DEST_KUBECONFIG "Destination kubeconfig file path (leave empty for default): "
     fi
 
@@ -527,10 +571,12 @@ main() {
         local repro_cmd="kubecopy --origin-type \"$ORIGIN_TYPE\" --origin-path \"$ORIGIN_PATH\" --dest-type \"$DEST_TYPE\" --dest-path \"$DEST_PATH\""
         if [ "$ORIGIN_TYPE" = "pod" ]; then
             repro_cmd="$repro_cmd --origin-ns \"$ORIGIN_NS\" --origin-pod \"$ORIGIN_POD\""
+            [ -n "$ORIGIN_CONTAINER" ] && repro_cmd="$repro_cmd --origin-container \"$ORIGIN_CONTAINER\""
             [ -n "$ORIGIN_KUBECONFIG" ] && repro_cmd="$repro_cmd --origin-kubeconfig \"$ORIGIN_KUBECONFIG\""
         fi
         if [ "$DEST_TYPE" = "pod" ]; then
             repro_cmd="$repro_cmd --dest-ns \"$DEST_NS\" --dest-pod \"$DEST_POD\""
+            [ -n "$DEST_CONTAINER" ] && repro_cmd="$repro_cmd --dest-container \"$DEST_CONTAINER\""
             [ -n "$DEST_KUBECONFIG" ] && repro_cmd="$repro_cmd --dest-kubeconfig \"$DEST_KUBECONFIG\""
         fi
         [ "$CHUNK_SIZE" != "$((5 * 1024 * 1024))" ] && repro_cmd="$repro_cmd --chunk-size \"$CHUNK_SIZE\""
@@ -553,8 +599,9 @@ main() {
     if [ "$ORIGIN_TYPE" = "local" ]; then
         REQ_KB=$(get_size_local "$ORIGIN_PATH")
     else
-        REQ_KB=$(get_size_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$ORIGIN_PATH")
+        REQ_KB=$(get_size_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "$ORIGIN_PATH")
     fi
+    log "Estimated original uncompressed size: $(format_size "$REQ_KB")"
 
     # 1. Setup specific temporary directories
     if [ "$ORIGIN_TYPE" = "local" ] || [ "$DEST_TYPE" = "local" ]; then
@@ -577,24 +624,24 @@ main() {
 
     if [ "$ORIGIN_TYPE" = "pod" ]; then
         local w_pod_org
-        w_pod_org=$(find_writable_dir_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$REQ_KB" "$TMP_DIR_ORIGIN_ARG")
+        w_pod_org=$(find_writable_dir_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "$REQ_KB" "$TMP_DIR_ORIGIN_ARG")
         if [ -z "$w_pod_org" ]; then
             log "Error: Could not find or allocate writable directory on origin pod."
             exit 1
         fi
         TMP_DIR_ORIGIN="$w_pod_org/kubecopy_org_$$"
-        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "mkdir -p '$TMP_DIR_ORIGIN'"
+        pod_exec "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "mkdir -p '$TMP_DIR_ORIGIN'"
     fi
 
     if [ "$DEST_TYPE" = "pod" ]; then
         local w_pod_dst
-        w_pod_dst=$(find_writable_dir_pod "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "$REQ_KB" "$TMP_DIR_DEST_ARG")
+        w_pod_dst=$(find_writable_dir_pod "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "$REQ_KB" "$TMP_DIR_DEST_ARG")
         if [ -z "$w_pod_dst" ]; then
             log "Error: Could not find or allocate writable directory on destination pod."
             exit 1
         fi
         TMP_DIR_DEST="$w_pod_dst/kubecopy_dst_$$"
-        pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "mkdir -p '$TMP_DIR_DEST'"
+        pod_exec "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "mkdir -p '$TMP_DIR_DEST'"
     fi
 
     # 2. Check Disk Space & Archive
@@ -616,28 +663,45 @@ main() {
         local org_dir org_base
         org_dir="$(dirname "$ORIGIN_PATH")"
         org_base="$(basename "$ORIGIN_PATH")"
-        archive_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME" "$org_dir" "$org_base"
-        ORIGIN_HASH=$(get_hash_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME")
+        archive_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME" "$org_dir" "$org_base"
+        ORIGIN_HASH=$(get_hash_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME")
         log "Origin hash: $ORIGIN_HASH"
         log "Splitting archive into chunks on pod..."
-        TOTAL_CHUNKS=$(split_file_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME" "$TMP_DIR_ORIGIN/chunk" "$CHUNK_SIZE")
+        TOTAL_CHUNKS=$(split_file_pod "$ORIGIN_NS" "$ORIGIN_POD" "$ORIGIN_CONTAINER" "$ORIGIN_KUBECONFIG" "$TMP_DIR_ORIGIN/$ARCHIVE_NAME" "$TMP_DIR_ORIGIN/chunk" "$CHUNK_SIZE")
         log "Total chunks: $TOTAL_CHUNKS"
     fi
 
     # 3. Transfer & Reassemble
     local i=0
     local DEST_HASH=""
+    local ARCHIVE_BYTES=0
+    
+    if [ "$ORIGIN_TYPE" = "local" ]; then
+        ARCHIVE_BYTES=$(wc -c < "$ARCHIVE_LOCAL" | tr -d ' ')
+    else
+        local cnt_arg=""
+        [ -n "$ORIGIN_CONTAINER" ] && cnt_arg="-c $ORIGIN_CONTAINER"
+        ARCHIVE_BYTES=$(kubectl -n "$ORIGIN_NS" exec $cnt_arg "$ORIGIN_POD" -- sh -c "wc -c < '$TMP_DIR_ORIGIN/$ARCHIVE_NAME' | tr -d ' '" 2>/dev/null)
+    fi
+    local ARCHIVE_KB=$((ARCHIVE_BYTES / 1024))
+    local TOTAL_SIZE_STR
+    TOTAL_SIZE_STR=$(format_size "$ARCHIVE_KB")
 
     if [ "$DEST_TYPE" = "local" ]; then
         while [ "$i" -lt "$TOTAL_CHUNKS" ]; do
-            log "Transferring chunk $i..."
+            local current_kb=$(((i * CHUNK_SIZE) / 1024))
+            local chunks_left=$((TOTAL_CHUNKS - i - 1))
+            log "Transferring chunk $((i+1))/$TOTAL_CHUNKS ($chunks_left chunks left)... [$(format_size "$current_kb") / $TOTAL_SIZE_STR transferred]"
             if [ "$ORIGIN_TYPE" = "pod" ]; then
                 local kc_arg=""
                 [ -n "$ORIGIN_KUBECONFIG" ] && kc_arg="--kubeconfig=$ORIGIN_KUBECONFIG"
+                local cnt_arg=""
+                [ -n "$ORIGIN_CONTAINER" ] && cnt_arg="-c=$ORIGIN_CONTAINER"
+                
                 if [ "$DRY_RUN" -eq 1 ]; then
-                    log "[DRY-RUN] kubectl $kc_arg cp $ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i $TMP_DIR_LOCAL/chunk_$i"
+                    log "[DRY-RUN] kubectl $kc_arg cp $ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i $TMP_DIR_LOCAL/chunk_$i $cnt_arg"
                 else
-                    kubectl_with_retry $kc_arg cp "$ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i" "$TMP_DIR_LOCAL/chunk_$i"
+                    kubectl_with_retry $kc_arg cp "$ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i" "$TMP_DIR_LOCAL/chunk_$i" $cnt_arg
                 fi
             else
                 if [ "$DRY_RUN" -eq 1 ]; then
@@ -662,15 +726,20 @@ main() {
 
     else
         while [ "$i" -lt "$TOTAL_CHUNKS" ]; do
-            log "Transferring chunk $i..."
+            local current_kb=$(((i * CHUNK_SIZE) / 1024))
+            local chunks_left=$((TOTAL_CHUNKS - i - 1))
+            log "Transferring chunk $((i+1))/$TOTAL_CHUNKS ($chunks_left chunks left)... [$(format_size "$current_kb") / $TOTAL_SIZE_STR transferred]"
             
             if [ "$ORIGIN_TYPE" = "local" ]; then
                 local kc_arg=""
                 [ -n "$DEST_KUBECONFIG" ] && kc_arg="--kubeconfig=$DEST_KUBECONFIG"
+                local cnt_arg=""
+                [ -n "$DEST_CONTAINER" ] && cnt_arg="-c=$DEST_CONTAINER"
+                
                 if [ "$DRY_RUN" -eq 1 ]; then
-                    log "[DRY-RUN] kubectl $kc_arg cp $TMP_DIR_LOCAL/chunk_$i $DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i"
+                    log "[DRY-RUN] kubectl $kc_arg cp $TMP_DIR_LOCAL/chunk_$i $DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i $cnt_arg"
                 else
-                    kubectl_with_retry $kc_arg cp "$TMP_DIR_LOCAL/chunk_$i" "$DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i"
+                    kubectl_with_retry $kc_arg cp "$TMP_DIR_LOCAL/chunk_$i" "$DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i" $cnt_arg
                 fi
             else
                 # Pod to Pod: fetch to local tmp, then push to dest
@@ -683,13 +752,18 @@ main() {
                 [ -n "$ORIGIN_KUBECONFIG" ] && okc_arg="--kubeconfig=$ORIGIN_KUBECONFIG"
                 local dkc_arg=""
                 [ -n "$DEST_KUBECONFIG" ] && dkc_arg="--kubeconfig=$DEST_KUBECONFIG"
+                
+                local ocnt_arg=""
+                [ -n "$ORIGIN_CONTAINER" ] && ocnt_arg="-c=$ORIGIN_CONTAINER"
+                local dcnt_arg=""
+                [ -n "$DEST_CONTAINER" ] && dcnt_arg="-c=$DEST_CONTAINER"
 
                 if [ "$DRY_RUN" -eq 1 ]; then
-                    log "[DRY-RUN] kubectl $okc_arg cp $ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i $TMP_DIR_LOCAL/chunk_$i"
-                    log "[DRY-RUN] kubectl $dkc_arg cp $TMP_DIR_LOCAL/chunk_$i $DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i"
+                    log "[DRY-RUN] kubectl $okc_arg cp $ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i $TMP_DIR_LOCAL/chunk_$i $ocnt_arg"
+                    log "[DRY-RUN] kubectl $dkc_arg cp $TMP_DIR_LOCAL/chunk_$i $DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i $dcnt_arg"
                 else
-                    kubectl_with_retry $okc_arg cp "$ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i" "$TMP_DIR_LOCAL/chunk_$i"
-                    kubectl_with_retry $dkc_arg cp "$TMP_DIR_LOCAL/chunk_$i" "$DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i"
+                    kubectl_with_retry $okc_arg cp "$ORIGIN_NS/$ORIGIN_POD:$TMP_DIR_ORIGIN/chunk_$i" "$TMP_DIR_LOCAL/chunk_$i" $ocnt_arg
+                    kubectl_with_retry $dkc_arg cp "$TMP_DIR_LOCAL/chunk_$i" "$DEST_NS/$DEST_POD:$TMP_DIR_DEST/chunk_$i" $dcnt_arg
                     rm -f "$TMP_DIR_LOCAL/chunk_$i"
                 fi
             fi
@@ -698,8 +772,8 @@ main() {
 
         if [ "$DRY_RUN" -eq 0 ]; then
             log "Reassembling chunks on destination pod..."
-            rebuild_file_pod "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "$TMP_DIR_DEST/chunk" "$TOTAL_CHUNKS" "$TMP_DIR_DEST/$ARCHIVE_NAME"
-            DEST_HASH=$(get_hash_pod "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "$TMP_DIR_DEST/$ARCHIVE_NAME")
+            rebuild_file_pod "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "$TMP_DIR_DEST/chunk" "$TOTAL_CHUNKS" "$TMP_DIR_DEST/$ARCHIVE_NAME"
+            DEST_HASH=$(get_hash_pod "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "$TMP_DIR_DEST/$ARCHIVE_NAME")
             if [ "$ORIGIN_HASH" != "$DEST_HASH" ]; then
                 log "Error: Hash mismatch (Origin: $ORIGIN_HASH, Dest: $DEST_HASH)"
                 exit 1
@@ -707,8 +781,8 @@ main() {
             log "Hashes match. Extracting..."
             local dst_dir
             dst_dir="$(dirname "$DEST_PATH")"
-            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "mkdir -p '$dst_dir'"
-            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_KUBECONFIG" "tar -xzf '$TMP_DIR_DEST/$ARCHIVE_NAME' -C '$dst_dir'"
+            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "mkdir -p '$dst_dir'"
+            pod_exec "$DEST_NS" "$DEST_POD" "$DEST_CONTAINER" "$DEST_KUBECONFIG" "tar -xzf '$TMP_DIR_DEST/$ARCHIVE_NAME' -C '$dst_dir'"
         fi
     fi
 
